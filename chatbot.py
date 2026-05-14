@@ -1,6 +1,7 @@
 import os
 import random
-from typing import List, Dict
+import requests
+from typing import List
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -14,19 +15,59 @@ from langchain_anthropic import ChatAnthropic
 
 
 # =====================================================
-# 🌐 WEB SEARCH TOOL
+# ⚡ TOKEN OPTIMIZED SETTINGS
 # =====================================================
-def web_search(query, max_results=5):
-    results = []
+MAX_MEMORY = 3
+MAX_WEB_RESULTS = 3
+MAX_SNIPPET_LEN = 120
+
+
+# =====================================================
+# 🌐 WEB SEARCH (OPTIMIZED)
+# =====================================================
+def google_search(query, max_results=3):
+    api_key = os.getenv("SERPAPI_KEY")
+    if not api_key:
+        return ""
 
     try:
+        url = "https://serpapi.com/search.json"
+        params = {"q": query, "api_key": api_key, "num": max_results}
+        data = requests.get(url, params=params).json()
+
+        results = []
+        for r in data.get("organic_results", []):
+            title = r.get("title", "")
+            link = r.get("link", "")
+            snippet = r.get("snippet", "")[:MAX_SNIPPET_LEN]
+            results.append(f"{title} | {snippet} | {link}")
+
+        return "\n".join(results)
+
+    except:
+        return ""
+
+
+def ddg_search(query, max_results=3):
+    try:
+        results = []
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=max_results):
-                results.append(f"{r['title']} - {r['href']}")
-    except Exception as e:
-        return f"Search error: {str(e)}"
+                title = r.get("title", "")
+                body = r.get("body", "")[:MAX_SNIPPET_LEN]
+                link = r.get("href", "")
+                results.append(f"{title} | {body} | {link}")
 
-    return "\n".join(results)
+        return "\n".join(results)
+    except:
+        return ""
+
+
+def web_search(query):
+    google = google_search(query)
+    ddg = ddg_search(query)
+
+    return (google + "\n" + ddg).strip()[:1500]  # 🔥 hard token cap
 
 
 # =====================================================
@@ -35,23 +76,24 @@ def web_search(query, max_results=5):
 def should_search(query: str) -> bool:
     keywords = [
         "latest", "news", "today", "2026", "current",
-        "update", "price", "who is", "what is", "real time"
+        "update", "price", "who is", "what is",
+        "vs", "best", "comparison"
     ]
     return any(k in query.lower() for k in keywords)
 
 
 # =====================================================
-# 🧠 MEMORY SYSTEM
+# 🧠 MEMORY (TOKEN OPTIMIZED)
 # =====================================================
 class AgentMemory:
     def __init__(self):
         self.history: List[str] = []
 
     def add(self, text: str):
-        self.history.append(text)
+        self.history.append(text[-300:])  # trim stored memory
 
-    def get(self, limit=6):
-        return "\n".join(self.history[-limit:])
+    def get(self):
+        return "\n".join(self.history[-MAX_MEMORY:])
 
 
 # =====================================================
@@ -63,7 +105,6 @@ class ChatBotSystem:
 
         self.choice = choice
 
-        # ---------------- LLMs ----------------
         self.agents = {
             "openai": ChatOpenAI(
                 model="gpt-4o-mini",
@@ -84,7 +125,6 @@ class ChatBotSystem:
             ),
         }
 
-        # ---------------- MEMORY ----------------
         self.memory = {
             "openai": AgentMemory(),
             "gemini": AgentMemory(),
@@ -102,7 +142,7 @@ class ChatBotSystem:
         return self.debate_system(question)
 
     # =================================================
-    # SINGLE MODEL MODE
+    # SINGLE MODE (OPTIMIZED)
     # =================================================
     def single_model(self, question):
 
@@ -116,24 +156,41 @@ class ChatBotSystem:
 
         context = self.build_context(question)
 
+        prompt = f"""
+Be concise (max 150 words).
+
+{context}
+
+Question:
+{question}
+"""
+
         return self.agents[agent].invoke(
-            [HumanMessage(content=context)]
+            [HumanMessage(content=prompt)]
         ).content
 
     # =================================================
-    # 🌐 CONTEXT BUILDER (WEB ENABLED)
+    # 🌐 CONTEXT BUILDER (1 SEARCH ONLY)
     # =================================================
     def build_context(self, question):
 
         if should_search(question):
-            results = web_search(question)
-            return f"""
-REAL-TIME WEB RESULTS:
-{results}
 
-QUESTION:
-{question}
+            # query rewrite (cheap + effective)
+            refined = self.agents["gemini"].invoke([
+                HumanMessage(content=f"Rewrite as search query: {question}")
+            ]).content
+
+            results = web_search(refined)
+
+            return f"""
+SEARCH:
+{refined}
+
+RESULTS:
+{results}
 """
+
         return question
 
     # =================================================
@@ -142,18 +199,19 @@ QUESTION:
     def debate_system(self, question):
 
         agents = list(self.agents.keys())
-
         context = self.build_context(question)
 
-        # =========================
-        # ROUND 1: INITIAL ANSWERS
-        # =========================
         responses = {}
 
+        # =========================
+        # ROUND 1 (SHORT ANSWERS)
+        # =========================
         for a in agents:
 
             prompt = f"""
 You are {a.upper()}.
+
+Be concise (max 120 words).
 
 Context:
 {context}
@@ -161,7 +219,7 @@ Context:
 Memory:
 {self.memory[a].get()}
 
-Give best answer.
+Answer:
 """
 
             resp = self.agents[a].invoke(
@@ -169,10 +227,10 @@ Give best answer.
             ).content
 
             responses[a] = resp
-            self.memory[a].add(f"Initial: {resp}")
+            self.memory[a].add(resp)
 
         # =========================
-        # ROUND 2: CRITIQUE PHASE
+        # ROUND 2 (CRITIQUE)
         # =========================
         for a in agents:
 
@@ -181,59 +239,50 @@ Give best answer.
             prompt = f"""
 You are {a.upper()}.
 
+Be short.
+
 Your answer:
-{responses[a]}
+{responses[a][:300]}
 
-Other agents:
-{chr(10).join([f"{o}: {responses[o]}" for o in others])}
+Others:
+{chr(10).join([f"{o}: {responses[o][:200]}" for o in others])}
 
-TASK:
-- Critique others
-- Improve your answer
-- Correct mistakes
-
-Return improved answer only.
+Improve & fix errors.
 """
 
-            improved = self.agents[a].invoke(
+            responses[a] = self.agents[a].invoke(
                 [HumanMessage(content=prompt)]
             ).content
 
-            responses[a] = improved
-            self.memory[a].add(f"Critique: {improved}")
+            self.memory[a].add(responses[a])
 
         # =========================
-        # ROUND 3: MESSAGE PASSING LOOP
+        # ROUND 3 (FINAL REFINEMENT)
         # =========================
-        for _ in range(2):
+        for _ in range(1):  # reduced loop for token saving
 
             updated = {}
 
             for a in agents:
 
                 prompt = f"""
-You are {a.upper()} in debate.
+Refine answer (max 120 words).
 
 Memory:
 {self.memory[a].get()}
 
-Other agents:
-{chr(10).join([f"{o}: {responses[o]}" for o in agents if o != a])}
-
-Refine your reasoning.
+Others:
+{chr(10).join([f"{o}: {responses[o][:150]}" for o in agents if o != a])}
 """
 
-                resp = self.agents[a].invoke(
+                updated[a] = self.agents[a].invoke(
                     [HumanMessage(content=prompt)]
                 ).content
-
-                updated[a] = resp
-                self.memory[a].add(f"Refined: {resp}")
 
             responses = updated
 
         # =========================
-        # 📊 SCORING
+        # 📊 SCORING (SHORT)
         # =========================
         scores = self.score(responses)
 
@@ -243,74 +292,50 @@ Refine your reasoning.
         return self.judge(question, responses, scores)
 
     # =================================================
-    # 📊 SCORING ENGINE
+    # 📊 SCORING (TOKEN OPTIMIZED)
     # =================================================
     def score(self, responses):
 
-        judge = self.agents["gemini"]
-
         prompt = f"""
-Score (0-10):
+Score 0-10:
 
-OpenAI:
-{responses['openai']}
+OpenAI: {responses['openai'][:200]}
+Gemini: {responses['gemini'][:200]}
+Claude: {responses['claude'][:200]}
 
-Gemini:
-{responses['gemini']}
-
-Claude:
-{responses['claude']}
-
-Return JSON only:
-{{
-  "openai": {{"accuracy":0,"reasoning":0,"depth":0}},
-  "gemini": {{"accuracy":0,"reasoning":0,"depth":0}},
-  "claude": {{"accuracy":0,"reasoning":0,"depth":0}}
-}}
+Return JSON only.
 """
 
-        return judge.invoke([HumanMessage(content=prompt)]).content
+        return self.agents["gemini"].invoke(
+            [HumanMessage(content=prompt)]
+        ).content
 
     # =================================================
     # 🧑‍⚖️ INDEPENDENT JUDGE
     # =================================================
     def judge(self, question, responses, scores):
 
-        judge_model = random.choice([
+        judge = random.choice([
             self.agents["gemini"],
             self.agents["claude"]
         ])
 
         prompt = f"""
-You are a neutral judge.
+Be extremely concise.
 
-QUESTION:
-{question}
+Q: {question}
 
-ANSWERS:
-OpenAI:
-{responses['openai']}
+A1: {responses['openai'][:200]}
+A2: {responses['gemini'][:200]}
+A3: {responses['claude'][:200]}
 
-Gemini:
-{responses['gemini']}
-
-Claude:
-{responses['claude']}
-
-SCORES:
+Scores:
 {scores}
 
-TASK:
-1. Compare reasoning
-2. Pick winner
-3. Give final improved answer
-
-FORMAT:
-Winner:
-Reason:
-Final Answer:
+Output:
+Winner + Reason + Final Answer
 """
 
-        return judge_model.invoke(
+        return judge.invoke(
             [HumanMessage(content=prompt)]
         ).content
